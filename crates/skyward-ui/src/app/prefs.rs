@@ -42,7 +42,7 @@ pub const SCREEN_OFF: [Option<u64>; 7] = [Some(15_000), Some(30_000), Some(60_00
 /// The time zones the clock and the times on the pages can keep, in the
 /// order their page lists them: the name, the cities it covers, and the
 /// zone's name in the tz database.
-pub const TIME_ZONES: [(Text, Text, &str); 9] = [
+pub const TIME_ZONES: [(Text, Text, &str); 10] = [
     (["中国标准时间", "中國標準時間", "China Standard Time"], ["北京、上海", "北京、上海", "Beijing, Shanghai"], "Asia/Shanghai"),
     (["香港时间", "香港時間", "Hong Kong Time"], ["香港", "香港", "Hong Kong"], "Asia/Hong_Kong"),
     (["台北时间", "台北時間", "Taipei Time"], ["台北", "台北", "Taipei"], "Asia/Taipei"),
@@ -52,6 +52,11 @@ pub const TIME_ZONES: [(Text, Text, &str); 9] = [
     (["中欧时间", "中歐時間", "Central European Time"], ["柏林、巴黎", "柏林、巴黎", "Berlin, Paris"], "Europe/Berlin"),
     (["美国东部时间", "美國東部時間", "Eastern Time"], ["纽约", "紐約", "New York"], "America/New_York"),
     (["美国太平洋时间", "美國太平洋時間", "Pacific Time"], ["洛杉矶", "洛杉磯", "Los Angeles"], "America/Los_Angeles"),
+    (
+        ["越南时间", "越南時間", "Vietnam Time"],
+        ["GMT+7", "GMT+7", "GMT+7"],
+        "Asia/Ho_Chi_Minh",
+    ),
 ];
 
 impl App {
