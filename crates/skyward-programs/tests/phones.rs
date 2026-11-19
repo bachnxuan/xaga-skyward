@@ -187,12 +187,13 @@ fn every_phone_names_one_program_for_each_service() {
 fn nezha_s_programs_are_found_as_they_were_started_on_the_phone() {
     let steps = secure::steps(&phone("nezha", &[("ro.boot.hardware", "qcom"), ("ro.special_edition", "true")])).unwrap();
     let expected = [
-        Started { service: listeners(), sockets: vec![socket("notify-topology", "drmrpc")], environment: Vec::new(), anew: false },
+        Started { service: listeners(), sockets: vec![socket("notify-topology", "drmrpc")], environment: Vec::new(), anew: false, wait_process: false },
         Started {
             service: Service { capabilities: strings(&["WAKE_ALARM", "BLOCK_SUSPEND"]), ..program("/vendor/bin/hlosminkdaemon", &ON_VENDOR, "system", &["system", "oem_2912", "wakelock"]) },
             sockets: vec![socket("ssgtzd", "oem_2912"), socket("hlos_mink_opener", "system")],
             environment: Vec::new(),
             anew: false,
+            wait_process: false,
         },
         Started::from(Service {
             ready_service: Some(KEYS.into()),
@@ -263,12 +264,13 @@ fn ishtar_s_programs_are_found_as_they_were_started_on_the_phone_and_its_opener_
     let properties = [("ro.boot.hardware", "qcom"), ("ro.boot.product.vendor.sku", "kalama"), ("ro.boot.product.hardware.sku", "ishtar")];
     let steps = secure::steps(&phone("ishtar", &properties)).unwrap();
     let expected = [
-        Started { service: listeners(), sockets: vec![socket("notify-topology", "drmrpc")], environment: Vec::new(), anew: false },
+        Started { service: listeners(), sockets: vec![socket("notify-topology", "drmrpc")], environment: Vec::new(), anew: false, wait_process: false },
         Started {
             service: program("/vendor/bin/ssgtzd", &ON_VENDOR, "system", &["system", "oem_2912"]),
             sockets: vec![socket("ssgtzd", "oem_2912"), socket("ssgtzd_opener", "system")],
             environment: Vec::new(),
             anew: false,
+            wait_process: false,
         },
         Started::from(Service {
             ready_service: Some(KEYS.into()),
@@ -381,6 +383,35 @@ fn a_program_its_partition_does_not_carry_is_not_one_the_phone_runs() {
     assert_eq!(runs("elsewhere"), Happens::No, "on a partition that is not read");
     let linked = phone.programs.iter().find(|p| p.name == "linked").unwrap();
     assert_eq!(phone.started_from(&linked.path), "/odm/bin/linked");
+}
+
+#[test]
+fn mediatek_transport_keeps_init_arguments_and_precedes_keymint() {
+    let tree = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tree.path().join("etc/init")).unwrap();
+    std::fs::create_dir_all(tree.path().join("bin")).unwrap();
+    std::fs::write(tree.path().join("bin/teei_daemon"), b"").unwrap();
+    std::fs::write(tree.path().join("etc/init/microtrust.rc"),
+        "service teei_daemon /odm/bin/teei_daemon -r 020b0000 -t 08030000\n    user system\n    group system\n    capabilities SYS_RAWIO\n    disabled\n    socket tee stream 0660 system system\n    setenv TEE_TEST value\non fs\n    start teei_daemon\n").unwrap();
+    let partition = Partition { name: "odm".into(), mounted: "/odm".into(), at: tree.path().into() };
+    let transport = Phone::read(vec![partition.clone()], HashMap::new(), None).unwrap();
+    let mut phone = phone("ishtar", &[("ro.boot.hardware", "qcom"), ("ro.boot.product.vendor.sku", "kalama"), ("ro.boot.product.hardware.sku", "ishtar")]);
+    phone.partitions.insert(0, partition);
+    phone.programs.extend(transport.programs);
+    phone.actions.extend(transport.actions);
+    let steps = secure::steps(&phone).unwrap();
+    let programs = secure::programs(&steps);
+    let tee = programs.iter().position(|p| p.service.path == "/odm/bin/teei_daemon").unwrap();
+    let key = programs.iter().position(|p| p.service.ready_service.as_deref() == Some(KEYS)).unwrap();
+    assert!(tee < key);
+    let tee = programs[tee];
+    assert!(tee.wait_process);
+    assert_eq!(tee.service.args, strings(&["-r", "020b0000", "-t", "08030000"]));
+    assert_eq!(tee.service.user.as_deref(), Some("system"));
+    assert_eq!(tee.service.groups, strings(&["system"]));
+    assert_eq!(tee.service.capabilities, strings(&["SYS_RAWIO"]));
+    assert_eq!(tee.sockets, vec![socket("tee", "system")]);
+    assert_eq!(tee.environment, vec![("TEE_TEST".into(), "value".into())]);
 }
 
 /// What init makes of the bootloader's properties names the script of the

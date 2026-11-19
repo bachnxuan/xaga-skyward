@@ -112,6 +112,7 @@ pub struct Started {
     pub service: Service,
     pub sockets: Vec<Socket>,
     pub environment: Vec<(String, String)>,
+    pub wait_process: bool,
     /// It holds on to a service the recovery serves itself, which goes
     /// when the recovery's own program ends: one an earlier run of the
     /// recovery left running is ended and started anew.
@@ -121,7 +122,7 @@ pub struct Started {
 impl From<Service> for Started {
     /// A program init gives nothing besides what `service` says.
     fn from(service: Service) -> Started {
-        Started { service, sockets: Vec::new(), environment: Vec::new(), anew: false }
+        Started { service, sockets: Vec::new(), environment: Vec::new(), anew: false, wait_process: false }
     }
 }
 
@@ -159,6 +160,11 @@ pub fn steps(phone: &Phone) -> Result<Vec<Step>> {
         if let Some(program) = named(phone, opener)? {
             start(&mut out, started(phone, program, Ready::Nothing, Vec::new()));
         }
+    }
+    if let Some(program) = named(phone, "teei_daemon")? {
+        let mut transport = started(phone, program, Ready::Nothing, Vec::new());
+        transport.wait_process = true;
+        start(&mut out, transport);
     }
 
     ensure!(described(phone, Kind::Aidl, KEYS).is_some(), "the phone describes no {KEYS}");
@@ -398,5 +404,5 @@ fn started(phone: &Phone, program: &Program, ready: Ready, registers: Vec<String
         groups: program.groups.clone(),
         capabilities: program.capabilities.clone().unwrap_or_default(),
     };
-    Started { service, sockets: program.sockets.clone(), environment: program.environment.clone(), anew: false }
+    Started { service, sockets: program.sockets.clone(), environment: program.environment.clone(), anew: false, wait_process: false }
 }

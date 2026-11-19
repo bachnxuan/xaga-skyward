@@ -81,6 +81,13 @@ pub fn start(programs: &[Started], libraries: Option<&Path>) -> Result<()> {
         let waiting = s.clone();
         let name = Path::new(&s.path).file_name().map_or_else(|| s.path.clone(), |n| n.to_string_lossy().into_owned());
         thread::Builder::new().name(name).spawn(move || supervise(&s, &who, &given)).context("start a supervising thread")?;
+        if program.wait_process {
+            let until = Instant::now() + READY_TIMEOUT;
+            while running(&waiting.path).is_none() {
+                ensure!(Instant::now() < until, "{} did not start", waiting.path);
+                thread::sleep(READY_POLL);
+            }
+        }
         ready(&waiting)?;
     }
     Ok(())
