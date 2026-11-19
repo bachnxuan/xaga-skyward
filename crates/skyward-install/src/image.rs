@@ -156,9 +156,18 @@ pub fn device_config<R: Read + Seek>(file: &mut R) -> Result<Option<Vec<u8>>> {
         let header = Header::parse(&mut Cursor::new(&head)).context("read the boot image header")?;
         (header.ramdisk_position() as u64, u64::from(header.ramdisk_size()))
     } else if head.starts_with(VENDOR_BOOT_MAGIC) {
-        // A vendor boot image, as a phone whose recovery rides there keeps
-        // its recovery in; its vendor ramdisk holds the configuration.
         let header = VendorHeader::read(&mut Cursor::new(&head)).context("read the vendor boot image header")?;
+        if header.v4.is_some() {
+            file.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            file.take((64 * 1024 * 1024 + 1) as u64).read_to_end(&mut bytes)?;
+            ensure!(bytes.len() <= 64 * 1024 * 1024, "vendor boot exceeds 64 MiB");
+            let image = skyward_bootimg::VendorBootImage::parse(&bytes)?;
+            return match image.recovery()? {
+                Some(fragment) => ramdisk_config(fragment),
+                None => Ok(None),
+            };
+        }
         (header.ramdisk_position() as u64, u64::from(header.vendor_ramdisk_size))
     } else {
         return Ok(None);
@@ -167,7 +176,12 @@ pub fn device_config<R: Read + Seek>(file: &mut R) -> Result<Option<Vec<u8>>> {
         return Ok(None);
     }
     file.seek(SeekFrom::Start(position)).context("seek to the ramdisk")?;
-    let mut ramdisk = BufReader::new(file.take(size));
+    ramdisk_config(file.take(size))
+}
+
+/// Find Skyward's device configuration in a packed recovery fragment.
+pub fn ramdisk_config(packed: impl Read) -> Result<Option<Vec<u8>>> {
+    let mut ramdisk = BufReader::new(packed);
     let start = ramdisk.fill_buf().context("read the ramdisk's first bytes")?;
     if ![LZ4_LEGACY, LZ4_FRAME, GZIP, NEWC].iter().any(|magic| start.starts_with(magic)) {
         return Ok(None);
@@ -419,8 +433,12 @@ mod tests {
             table: vec![skyward_bootimg::TableEntry {
                 size: ramdisk.len() as u32,
                 offset: 0,
-                kind: 3,
-                name: [0; 32],
+                kind: 2,
+                name: {
+                    let mut name = [0; 32];
+                    name[..8].copy_from_slice(b"recovery");
+                    name
+                },
                 board_id: [[0; 16]; 4],
             }],
             ramdisk,

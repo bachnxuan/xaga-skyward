@@ -10,10 +10,24 @@ use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
+/// Whether a ZIP carries a vendor boot recovery fragment.
+pub fn is_vendor_release(path: &Path) -> Result<bool> {
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut zip = zip::ZipArchive::new(file).context("read the ZIP")?;
+    let present = zip.by_name("skyward/recovery.cpio").is_ok();
+    Ok(present)
+}
+
 /// The image the zip at `path` holds, its only entry, read whole.
 pub fn unzip(path: &Path) -> Result<Vec<u8>> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut zip = zip::ZipArchive::new(file).with_context(|| format!("read {} as a zip", path.display()))?;
+    if let Ok(mut entry) = zip.by_name("skyward/recovery.cpio") {
+        ensure!(entry.size() > 0 && entry.size() <= 64 * 1024 * 1024, "invalid recovery fragment size");
+        let mut recovery = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut recovery).context("unzip recovery fragment")?;
+        return Ok(recovery);
+    }
     ensure!(zip.len() == 1, "{} holds {} entries, and a release's zip holds its image alone", path.display(), zip.len());
     let mut entry = zip.by_index(0).context("open the image in the zip")?;
     ensure!(entry.name().ends_with(".img"), "the zip holds {}, which is not an image", entry.name());
@@ -24,7 +38,11 @@ pub fn unzip(path: &Path) -> Result<Vec<u8>> {
 
 /// Check that `image` is Skyward, packed for the phone `codename` names.
 pub fn check(image: &[u8], codename: &str) -> Result<()> {
-    let config = image::device_config(&mut Cursor::new(image)).context("look into the image")?.context("the image is not Skyward")?;
+    let config = if image.starts_with(b"ANDROID!") || image.starts_with(b"VNDRBOOT") {
+        image::device_config(&mut Cursor::new(image))?
+    } else {
+        image::ramdisk_config(image)?
+    }.context("the image is not Skyward")?;
     let config = std::str::from_utf8(&config).context("the image's device configuration is not text")?;
     let named = skyward_config::codename(config).context("read the image's device configuration")?;
     ensure!(named == codename, "the image is Skyward for {named}, not for {codename}");
@@ -51,8 +69,39 @@ pub fn slots(dir: &Path, next: Slot, partition: &str) -> Result<Vec<Slot>> {
 /// Write `image` into the recovery partitions of `slots`, among the links
 /// in `dir`, and read each back; `progress` hears the bytes so far, of all.
 pub fn write(dir: &Path, image: &[u8], slots: &[Slot], partition: &str, progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
+    if partition == "vendor_boot" {
+        ensure!(!image.starts_with(b"VNDRBOOT") && !image.starts_with(b"ANDROID!"), "vendor_boot update requires a recovery fragment, not a whole image");
+        return write_vendor_boot(dir, image, slots, progress);
+    }
+    ensure!(image.starts_with(b"ANDROID!"), "dedicated recovery requires a boot image");
     let devices: Vec<PathBuf> = slots.iter().map(|&slot| image::device(dir, partition, slot)).collect();
     image::flash(&mut Cursor::new(image), image.len() as u64, &devices, progress)
+}
+
+/// Prepare every selected slot from its own installed vendor_boot before writing.
+pub fn write_vendor_boot(dir: &Path, recovery: &[u8], slots: &[Slot], progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    ensure!(!slots.is_empty(), "no partition to write");
+    let mut prepared = Vec::new();
+    for &slot in slots {
+        let path = image::device(dir, "vendor_boot", slot);
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&path).with_context(|| format!("open {} for writing", path.display()))?;
+        image::drop_cache(&file)?;
+        let mut base = Vec::new();
+        file.take((64 * 1024 * 1024 + 1) as u64).read_to_end(&mut base)?;
+        ensure!(base.len() <= 64 * 1024 * 1024, "{} exceeds 64 MiB", path.display());
+        let (output, _) = skyward_bootimg::VendorBootImage::prepare(&base, recovery)
+            .with_context(|| format!("prepare {}", path.display()))?;
+        let output = skyward_bootimg::avb::footed(&output, "vendor_boot", base.len(), &Sha256::digest(&output))?;
+        prepared.push((path, output));
+    }
+    let total = prepared.iter().map(|(_, bytes)| 2 * bytes.len() as u64).sum();
+    let mut completed = 0;
+    for (path, output) in prepared {
+        image::flash(&mut Cursor::new(&output), output.len() as u64, &[path], &mut |done, _| progress(completed + done, total))?;
+        completed += 2 * output.len() as u64;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -128,5 +177,61 @@ mod tests {
         assert_eq!(told.last(), Some(&(total, total)), "written and read back");
         assert_eq!(&std::fs::read(dir.path().join("recovery_a")).unwrap()[..newer.len()], &newer[..]);
         assert_eq!(&std::fs::read(dir.path().join("recovery_b")).unwrap()[..stock.len()], &stock[..], "the other slot left alone");
+    }
+    #[test]
+    fn vendor_slots_are_prepared_independently_before_writing() {
+        use abootimg_oxide::{VendorHeader, VendorHeaderV4};
+        use skyward_bootimg::{BootImage, TableEntry, VendorBootImage};
+        let dir = tempfile::tempdir().unwrap();
+        for (slot, id) in [("a", 1u8), ("b", 2)] {
+            let image = VendorBootImage {
+                header: VendorHeader {
+                    page_size: 4096, kernel_addr: id as u32, ramdisk_addr: 0,
+                    vendor_ramdisk_size: 4, cmdline: Box::new([0; 2048]), tags_addr: 0,
+                    board_name: [id; 16], dtb_size: 1, dtb_addr: 0,
+                    v4: Some(VendorHeaderV4 {
+                        vendor_ramdisk_table_size: 108, vendor_ramdisk_table_entry_num: 1,
+                        vendor_ramdisk_table_entry_size: 108, bootconfig_size: 1,
+                    }),
+                },
+                ramdisk: vec![id; 4], dtb: vec![id], bootconfig: vec![id],
+                table: vec![TableEntry { size: 4, offset: 0, kind: 1, name: [0; 32], board_id: [[id; 16]; 4] }],
+            };
+            let mut bytes = image.to_bytes().unwrap();
+            bytes.resize(65536, 0);
+            std::fs::write(dir.path().join(format!("vendor_boot_{slot}")), bytes).unwrap();
+        }
+        let original_b = std::fs::read(dir.path().join("vendor_boot_b")).unwrap();
+        let payload = BootImage::parse(&skyward_for("xaga")).unwrap().ramdisk;
+        let zip = zipped(&[("META-INF/com/google/android/update-binary", b"binary"), ("skyward/recovery.cpio", &payload)]);
+        assert!(is_vendor_release(zip.path()).unwrap());
+        assert_eq!(crate::package::identify(std::fs::File::open(zip.path()).unwrap()).unwrap(), crate::package::Package::Script);
+        let unpacked = unzip(zip.path()).unwrap();
+        check(&unpacked, "xaga").unwrap();
+        assert!(check(&unpacked, "other").is_err());
+        write_vendor_boot(dir.path(), &unpacked, &[Slot::A, Slot::B], &mut |_, _| {}).unwrap();
+        for (slot, id) in [("a", 1u8), ("b", 2)] {
+            let bytes = std::fs::read(dir.path().join(format!("vendor_boot_{slot}"))).unwrap();
+            let image = VendorBootImage::parse(&bytes).unwrap();
+            assert_eq!(&image.ramdisk[..4], &[id; 4]);
+            assert_eq!(image.dtb, [id]);
+            assert_eq!(image.bootconfig, [id]);
+            assert_eq!(image.table[0].board_id, [[id; 16]; 4]);
+            assert_eq!(image.recovery().unwrap(), Some(&payload[..]));
+            assert!(crate::image::is_skyward(&mut Cursor::new(bytes)).unwrap());
+        }
+        let kept = crate::keep::Kept::hold(dir.path(), Slot::A, "vendor_boot").unwrap().unwrap();
+        assert!(kept.wanted(Slot::B).unwrap().is_empty());
+        std::fs::write(dir.path().join("vendor_boot_b"), original_b).unwrap();
+        assert_eq!(kept.wanted(Slot::B).unwrap(), [Slot::B]);
+        kept.write(&[Slot::B], &mut |_, _| {}).unwrap();
+        let restored = VendorBootImage::parse(&std::fs::read(dir.path().join("vendor_boot_b")).unwrap()).unwrap();
+        assert_eq!(restored.dtb, [2]);
+        assert_eq!(&restored.ramdisk[..4], &[2; 4]);
+        assert_eq!(restored.recovery().unwrap(), Some(payload.as_slice()));
+        let a = std::fs::read(dir.path().join("vendor_boot_a")).unwrap();
+        std::fs::write(dir.path().join("vendor_boot_b"), b"broken").unwrap();
+        assert!(write_vendor_boot(dir.path(), &payload, &[Slot::A, Slot::B], &mut |_, _| {}).is_err());
+        assert_eq!(std::fs::read(dir.path().join("vendor_boot_a")).unwrap(), a);
     }
 }

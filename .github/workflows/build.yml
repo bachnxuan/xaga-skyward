@@ -70,6 +70,8 @@ jobs:
       - uses: ./.github/actions/setup
       - name: Build the recovery service for the phone
         run: cargo ndk -t arm64-v8a --platform 30 build --locked --release -p skyward
+      - name: Build the vendor boot installer for the phone
+        run: cargo ndk -t arm64-v8a --platform 30 build --locked --release -p skyward-install --bin skyward-installer
       # It runs as a second system's first program, before any library is
       # there to load.
       - name: Build the second system's first program, static
@@ -82,6 +84,7 @@ jobs:
         run: |
           mkdir tools
           cp target/aarch64-linux-android/release/skyward target/release/skyward-pack tools/
+          cp target/aarch64-linux-android/release/skyward-installer tools/
           cp target/system-init/aarch64-linux-android/release/system-init tools/
       - uses: actions/upload-artifact@v7
         with:
@@ -124,21 +127,19 @@ jobs:
           path: tools
       - name: Make the tools runnable
         run: chmod +x tools/skyward tools/skyward-pack
-      - name: Read the stock build the recovery is made on
+      - name: Read the recovery template source
         id: stock
         run: tools/skyward-pack stock --config "devices/${{ matrix.device }}.toml" >> "$GITHUB_OUTPUT"
-      - name: Restore the stock recovery
+      - name: Restore the recovery template
         id: cache
         uses: actions/cache@v6
         with:
           path: stock/recovery.img
           key: stock-recovery-${{ steps.stock.outputs.recovery }}
-      # Only what the recovery partition takes is read of the package,
-      # which is several gigabytes in all.
-      - name: Take the recovery partition out of the stock package
+      - name: Acquire the verified recovery template
         if: steps.cache.outputs.cache-hit != 'true'
         run: tools/skyward-pack stock --config "devices/${{ matrix.device }}.toml" --out stock/recovery.img
-      - name: Check the stock recovery
+      - name: Check the recovery template
         env:
           RECOVERY: ${{ steps.stock.outputs.recovery }}
         run: echo "$RECOVERY  stock/recovery.img" | sha256sum --check
@@ -151,17 +152,23 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ]; then version="$GITHUB_REF_NAME"; else version="${GITHUB_SHA::7}"; fi
           name="skyward-$version-$DEVICE-$STOCK"
           mkdir out
-          tools/skyward-pack recovery --stock stock/recovery.img --binary tools/skyward --system-init tools/system-init \
-            --config "devices/$DEVICE.toml" --font resources/fonts/MiSansVF.ttf --mono resources/fonts/KirkMono-Regular.ttf \
-            --mono-license resources/fonts/KirkMono-OFL.txt --out "out/$name.img"
+          if [ "$DEVICE" = xaga ]; then
+            tools/skyward-pack payload --template stock/recovery.img --binary tools/skyward --system-init tools/system-init \
+              --config "devices/$DEVICE.toml" --font resources/fonts/MiSansVF.ttf --mono resources/fonts/KirkMono-Regular.ttf \
+              --mono-license resources/fonts/KirkMono-OFL.txt --out out/recovery.cpio
+            tools/skyward-pack installer --recovery out/recovery.cpio --installer tools/skyward-installer --out "out/$name.zip"
+          else
+            tools/skyward-pack recovery --stock stock/recovery.img --binary tools/skyward --system-init tools/system-init \
+              --config "devices/$DEVICE.toml" --font resources/fonts/MiSansVF.ttf --mono resources/fonts/KirkMono-Regular.ttf \
+              --mono-license resources/fonts/KirkMono-OFL.txt --out "out/$name.img"
+          fi
           echo "name=$name" >> "$GITHUB_OUTPUT"
-      # The image is the whole partition, flashed as it is, and most of it
-      # is the room the recovery leaves empty; it is handed out zipped.
+      # Dedicated recovery images are distributed as a single-image ZIP.
       - name: Zip the image
         working-directory: out
         env:
           NAME: ${{ steps.pack.outputs.name }}
-        run: zip -9 "$NAME.zip" "$NAME.img"
+        run: if [ ! -f "$NAME.zip" ]; then zip -9 "$NAME.zip" "$NAME.img"; fi
       # The artifact takes the zip's name.
       - uses: actions/upload-artifact@v7
         with:

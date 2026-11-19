@@ -2437,8 +2437,10 @@ dependencies = [
  "abootimg-oxide",
  "anyhow",
  "cpio",
+ "flate2",
  "libc",
  "lz4_flex 0.14.0",
+ "sha2 0.10.9",
  "tempfile",
 ]
 
@@ -2588,6 +2590,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hex",
+ "libc",
  "rust-fs-core",
  "rust-fs-erofs",
  "serde_json",
@@ -2597,6 +2600,8 @@ dependencies = [
  "skyward-programs",
  "tempfile",
  "unpayload",
+ "ureq",
+ "zip 8.6.0",
 ]
 
 [[package]]

@@ -793,6 +793,7 @@ fn flash_image(ctx: &Context, kind: ImageKind, size: u64) -> Result<Done> {
     };
     ensure!(partitions.contains(&partition), "{partition} is not among {partitions:?}");
     ensure!(!slots.is_empty(), "no slot chosen for {partition}");
+    ensure!(kind != ImageKind::VendorBoot || slots.len() == 1, "a vendor_boot image can only be written to one slot");
     if [skyward_systems::store::BOOT, skyward_systems::store::INIT_BOOT].contains(&partition) {
         installed_boot_set()?;
     }
@@ -843,7 +844,15 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
     let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
     extract_script()?;
     shell_at_sbin()?;
-    let kept = hold(ctx, slot)?;
+    let vendor_release = ctx.options.recovery_partition == "vendor_boot" && crate::upgrade::is_vendor_release(Path::new(fuse::PACKAGE))?;
+    let kept = if vendor_release {
+        let payload = crate::upgrade::unzip(Path::new(fuse::PACKAGE))?;
+        let codename = skyward_sys::prop("ro.product.device").context("ro.product.device is unset")?;
+        crate::upgrade::check(&payload, &codename)?;
+        None
+    } else {
+        hold(ctx, slot)?
+    };
     installed_boot_set()?;
     detach_once(ctx)?;
     // While an update is in flight, the slot's partitions in super are its

@@ -6,10 +6,9 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-mod avb;
 mod described;
 
-use skyward_bootimg::{BootImage, Ramdisk, VendorBootImage};
+use skyward_bootimg::{avb, BootImage, Ramdisk, VendorBootImage};
 
 /// Builds Skyward recovery images from a device's own stock images.
 #[derive(Parser)]
@@ -28,6 +27,49 @@ enum Cmd {
     /// Unpack and pack an image's ramdisk unchanged, to check that a rebuilt
     /// archive keeps every entry.
     Repack { image: PathBuf, out: PathBuf },
+    /// Build a standalone Skyward recovery fragment from an AOSP template.
+    Payload {
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        binary: PathBuf,
+        #[arg(long)]
+        system_init: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        font: PathBuf,
+        #[arg(long)]
+        mono: PathBuf,
+        #[arg(long)]
+        mono_license: PathBuf,
+        #[arg(long = "add", value_name = "NAME=PATH")]
+        add: Vec<String>,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Prepare an unsigned vendor_boot from a target-local base.
+    PrepareVendorBoot {
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long)]
+        recovery: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        check_only: bool,
+        #[arg(long)]
+        strip_avb_footer: bool,
+    },
+    /// Create a recovery-installable ZIP from a payload and Android installer.
+    Installer {
+        #[arg(long)]
+        recovery: PathBuf,
+        #[arg(long)]
+        installer: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Join a kernel and another image's ramdisk into one boot image.
     Boot {
         /// Image holding the kernel (the device's boot partition).
@@ -42,14 +84,12 @@ enum Cmd {
     /// Build a Skyward recovery image on top of the device's stock recovery:
     /// its init, adbd, SELinux policy and libraries stay, the recovery
     /// service becomes Skyward. The image fills the whole partition and ends
-    /// in an unsigned AVB footer of its own. A stock recovery may be a boot
-    /// image for a `recovery` partition or a vendor boot image for a
-    /// `vendor_boot` one, as MediaTek phones whose recovery rides there
-    /// keep theirs; either is written back as it was read.
+    /// in an unsigned AVB footer of its own. This command is for a
+    /// dedicated recovery boot image.
     Recovery {
         /// The device's stock recovery image: the whole partition, as the
         /// phone or a full update package holds it, ending in its AVB
-        /// footer; a boot image or a vendor boot image.
+        /// footer.
         #[arg(long)]
         stock: PathBuf,
         /// Skyward built for the device (aarch64-linux-android).
@@ -116,6 +156,88 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
+        Cmd::Payload { template, binary, system_init, config, font, mono, mono_license, add, out } => {
+            skyward_config::DeviceConfig::load(&config)?;
+            let data = bounded(&template)?;
+            let fragment = if data.starts_with(b"VNDRBOOT") {
+                let image = VendorBootImage::parse(&data)?;
+                match image.recovery() {
+                    Ok(Some(recovery)) => recovery.to_vec(),
+                    _ if image.header.v4.is_none() || image.table.len() == 1 => image.ramdisk,
+                    _ => anyhow::bail!("template has no unambiguous AOSP recovery ramdisk"),
+                }
+            } else if data.starts_with(b"ANDROID!") {
+                BootImage::parse(&data)?.ramdisk
+            } else {
+                data
+            };
+            let mut rd = Ramdisk::decode(&fragment)?;
+            let files = Packed { binary: &binary, system_init: &system_init, config: &config, font: &font, mono: &mono, mono_license: &mono_license };
+            edit_ramdisk(&mut rd, &template, &files, &add, false)?;
+            rd.entries.retain(|entry| {
+                let name = entry.name.trim_start_matches("./").trim_start_matches('/');
+                !["lib/modules", "system/lib/modules", "vendor/lib/modules"].iter().any(|path| name == *path || name.starts_with(&format!("{path}/")))
+            });
+            publish(&out, &[&template, &binary, &system_init, &config, &font, &mono, &mono_license], &rd.encode()?)?;
+            Ok(())
+        }
+        Cmd::PrepareVendorBoot { base, recovery, out, check_only, strip_avb_footer } => {
+            check_output(&out, &[&base, &recovery])?;
+            let source = bounded(&base)?;
+            let payload = bounded(&recovery)?;
+            let (output, stripped) = VendorBootImage::prepare(&source, &payload, strip_avb_footer)?;
+            let before = VendorBootImage::parse(&source)?;
+            let after = VendorBootImage::parse(&output)?;
+            let report_image = |image: &VendorBootImage| {
+                let fragments: Vec<_> = image.table.iter().map(|entry| {
+                    let start = entry.offset as usize;
+                    let end = start + entry.size as usize;
+                    serde_json::json!({
+                        "name": String::from_utf8_lossy(&entry.name[..entry.name.iter().position(|&b| b == 0).unwrap_or(32)]),
+                        "type": entry.kind, "offset": entry.offset, "size": entry.size,
+                        "board_ids": entry.board_id,
+                        "sha256": hex::encode(Sha256::digest(&image.ramdisk[start..end]))
+                    })
+                }).collect();
+                serde_json::json!({
+                    "page_size": image.header.page_size,
+                    "kernel_addr": image.header.kernel_addr,
+                    "ramdisk_addr": image.header.ramdisk_addr,
+                    "tags_addr": image.header.tags_addr,
+                    "dtb_addr": image.header.dtb_addr,
+                    "board": hex::encode(image.header.board_name),
+                    "cmdline_sha256": hex::encode(Sha256::digest(image.header.cmdline.as_ref())),
+                    "dtb_sha256": hex::encode(Sha256::digest(&image.dtb)),
+                    "bootconfig_sha256": hex::encode(Sha256::digest(&image.bootconfig)),
+                    "fragments": fragments
+                })
+            };
+            println!("{}", serde_json::json!({
+                "base_sha256": hex::encode(Sha256::digest(&source)),
+                "recovery_sha256": hex::encode(Sha256::digest(&payload)),
+                "output_sha256": hex::encode(Sha256::digest(&output)),
+                "action": if before.recovery()?.is_some() { "replace" } else { "append" },
+                "base": report_image(&before), "output": report_image(&after),
+                "output_size": output.len(), "check_only": check_only,
+                "avb_footer_stripped": stripped, "output_unsigned": true
+            }));
+            if !check_only {
+                publish(&out, &[&base, &recovery], &output)?;
+            }
+            Ok(())
+        }
+        Cmd::Installer { recovery, installer, out } => {
+            let payload = bounded(&recovery)?;
+            let binary = bounded(&installer)?;
+            let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            archive.start_file("META-INF/com/google/android/update-binary", options.unix_permissions(0o755))?;
+            archive.write_all(&binary)?;
+            archive.start_file("skyward/recovery.cpio", options)?;
+            archive.write_all(&payload)?;
+            let bytes = archive.finish()?.into_inner();
+            publish(&out, &[&recovery, &installer], &bytes)
+        }
         Cmd::List { image } => list(&image),
         Cmd::Cat { image, path } => {
             let rd = Ramdisk::decode(Image::read(&image)?.ramdisk())?;
@@ -141,9 +263,10 @@ fn main() -> Result<()> {
             let size = partition_size(&stock)?;
             skyward_config::DeviceConfig::load(&config)?;
             let mut img = Image::read(&stock)?;
+            ensure!(!matches!(img, Image::Vendor(_)), "vendor_boot requires the payload and installer commands");
             let mut rd = Ramdisk::decode(img.ramdisk())?;
             let files = Packed { binary: &binary, system_init: &system_init, config: &config, font: &font, mono: &mono, mono_license: &mono_license };
-            edit_ramdisk(&mut rd, &stock, &files, &add)?;
+            edit_ramdisk(&mut rd, &stock, &files, &add, true)?;
             img.set_ramdisk(rd.encode()?)?;
             let bytes = img.to_bytes()?;
             let partition = match img {
@@ -163,7 +286,12 @@ fn main() -> Result<()> {
         Cmd::Stock { config, out } => {
             let cfg = skyward_config::DeviceConfig::load(&config)?;
             let stock = cfg.stock.as_ref().with_context(|| format!("{} names no stock build", config.display()))?;
-            println!("version={}\npackage={}\nrecovery={}", stock.version, stock.package, stock.recovery);
+            println!("version={}\nrecovery={}", stock.version, stock.recovery);
+            if let Some(package) = &stock.package {
+                println!("package={package}");
+            } else if let Some(image) = &stock.image {
+                println!("image={image}");
+            }
             match out {
                 Some(out) => take_stock_recovery(stock, &cfg.device.recovery_partition, &out),
                 None => Ok(()),
@@ -172,9 +300,52 @@ fn main() -> Result<()> {
         Cmd::Described { config, partitions, out } => {
             let stock = skyward_config::DeviceConfig::load(&config)?.stock.with_context(|| format!("{} names no stock build", config.display()))?;
             let partitions = if partitions.is_empty() { skyward_programs::phone::PARTITIONS.map(str::to_string).to_vec() } else { partitions };
-            described::take(&stock.package, &partitions, &out)
+            let package = stock.package.as_deref().context("described requires a full OTA package, not a standalone image")?;
+            described::take(package, &partitions, &out)
         }
     }
+}
+
+fn bounded(path: &Path) -> Result<Vec<u8>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let meta = file.metadata()?;
+    ensure!(meta.is_file() && meta.len() > 0 && meta.len() <= 64 * 1024 * 1024, "{} is not a bounded regular file", path.display());
+    let mut bytes = Vec::new();
+    file.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    ensure!(!bytes.is_empty() && bytes.len() <= 64 * 1024 * 1024, "{} exceeds 64 MiB or is empty", path.display());
+    Ok(bytes)
+}
+
+fn check_output(out: &Path, inputs: &[&Path]) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let parent = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let resolved = parent.canonicalize()?.join(out.file_name().context("output has no filename")?);
+    let output = match std::fs::symlink_metadata(out) {
+        Ok(meta) => {
+            ensure!(meta.is_file() && !meta.file_type().is_symlink(), "output must be a regular file, not a link");
+            Some(meta)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    for input in inputs {
+        let meta = std::fs::metadata(input)?;
+        ensure!(input.canonicalize()? != resolved && !output.as_ref().is_some_and(|o| o.dev() == meta.dev() && o.ino() == meta.ino()), "output aliases {}", input.display());
+    }
+    Ok(())
+}
+
+fn publish(out: &Path, inputs: &[&Path], bytes: &[u8]) -> Result<()> {
+    check_output(out, inputs)?;
+    let parent = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    staged.write_all(bytes)?;
+    staged.as_file().sync_all()?;
+    check_output(out, inputs)?;
+    staged.persist(out).map_err(|e| e.error).with_context(|| format!("publish {}", out.display()))?;
+    Ok(())
 }
 
 /// Take the partition the recovery is made on out of the stock build's full
@@ -185,9 +356,14 @@ fn main() -> Result<()> {
 fn take_stock_recovery(stock: &skyward_config::Stock, partition: &str, out: &Path) -> Result<()> {
     let parent = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| format!("make {}", parent.display()))?;
+    if let Some(url) = &stock.image {
+        let mut response = ureq::get(url).call().with_context(|| format!("download {url}"))?;
+        return take_direct(response.body_mut().as_reader(), &stock.recovery, out);
+    }
+    let package = stock.package.as_deref().context("stock has no OTA package")?;
     // Taken out beside where it goes, so it is moved there whole.
     let work = tempfile::Builder::new().prefix(".stock").tempdir_in(parent).with_context(|| format!("make a folder in {}", parent.display()))?;
-    let payload = unpayload::Payload::open_url(&stock.package).with_context(|| format!("open {}", stock.package))?;
+    let payload = unpayload::Payload::open_url(package).with_context(|| format!("open {package}"))?;
     let options = unpayload::ExtractOptions { output_dir: work.path().to_path_buf(), partitions: vec![partition.into()], ..Default::default() };
     let report = |event: unpayload::Event<'_>| match event {
         unpayload::Event::Started { partitions } => {
@@ -198,13 +374,23 @@ fn take_stock_recovery(stock: &skyward_config::Stock, partition: &str, out: &Pat
         unpayload::Event::Extracted(image) => println!("took {} out: {} bytes", image.partition, image.size),
         unpayload::Event::Progress { .. } => {}
     };
-    let taken = payload.extract(&options, &report).with_context(|| format!("take {partition} out of {}", stock.package))?;
-    let image = taken.iter().find(|i| i.partition == partition).with_context(|| format!("{} holds no {partition} partition", stock.package))?;
+    let taken = payload.extract(&options, &report).with_context(|| format!("take {partition} out of {package}"))?;
+    let image = taken.iter().find(|i| i.partition == partition).with_context(|| format!("{package} holds no {partition} partition"))?;
     let sum = hex::encode(image.sha256.as_deref().context("the package's own sum of the image was not checked")?);
-    ensure!(sum == stock.recovery, "the {partition} partition in {} has the SHA-256 {sum}, where the configuration names {}", stock.package, stock.recovery);
+    ensure!(sum == stock.recovery, "the {partition} partition in {package} has the SHA-256 {sum}, where the configuration names {}", stock.recovery);
     std::fs::rename(&image.path, out).with_context(|| format!("move {} to {}", image.path.display(), out.display()))?;
     println!("wrote {} ({} bytes), its SHA-256 the one the configuration names", out.display(), image.size);
     Ok(())
+}
+
+fn take_direct(reader: impl Read, expected: &str, out: &Path) -> Result<()> {
+    let mut bytes = Vec::new();
+    reader.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    ensure!(!bytes.is_empty() && bytes.len() <= 64 * 1024 * 1024, "image is empty or exceeds 64 MiB");
+    let sum = hex::encode(Sha256::digest(&bytes));
+    ensure!(sum == expected, "image SHA-256 is {sum}, expected {expected}");
+    Image::parse(&bytes).context("parse downloaded image")?;
+    publish(out, &[], &bytes)
 }
 
 /// The size of the partition `stock` fills: all of it, as the phone and a
@@ -312,7 +498,7 @@ struct Packed<'a> {
 }
 
 /// What Skyward adds to a stock ramdisk and changes in it.
-fn edit_ramdisk(rd: &mut Ramdisk, stock: &Path, files: &Packed<'_>, add: &[String]) -> Result<()> {
+fn edit_ramdisk(rd: &mut Ramdisk, stock: &Path, files: &Packed<'_>, add: &[String], legacy_properties: bool) -> Result<()> {
     // A stock recovery ramdisk has no third-party tree; refuse to build on
     // top of another custom recovery.
     if let Some(e) = rd.entries.iter().find(|e| e.name == "FFiles" || e.name.starts_with("twres")) {
@@ -360,7 +546,9 @@ fn edit_ramdisk(rd: &mut Ramdisk, stock: &Path, files: &Packed<'_>, add: &[Strin
         .with_context(|| format!("{} is not in the ramdisk", paths::PROP_DEFAULT))?
         .data;
     let mut props = without(stock_props, &BUILD_VERSION);
-    props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
+    if legacy_properties {
+        props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
+    }
     rd.replace(paths::PROP_DEFAULT, props)?;
     Ok(())
 }
@@ -410,6 +598,17 @@ fn list(image: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_direct_image_does_not_replace_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("image");
+        std::fs::write(&out, b"existing").unwrap();
+        let data = b"not an image";
+        assert!(take_direct(&data[..], &"0".repeat(64), &out).is_err());
+        assert!(take_direct(&data[..], &hex::encode(Sha256::digest(data)), &out).is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), b"existing");
+    }
 
     #[test]
     fn the_lines_that_set_a_name_are_the_only_ones_left_out() {

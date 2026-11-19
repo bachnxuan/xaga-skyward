@@ -99,8 +99,10 @@ pub struct DeviceConfig {
 pub struct Stock {
     /// The build's version, such as OS4.0.4.0.XPACNXM.
     pub version: String,
-    /// Where the package is downloaded from, over HTTPS.
-    pub package: String,
+    /// The full OTA package, when the image is extracted from one.
+    pub package: Option<String>,
+    /// A standalone recovery image.
+    pub image: Option<String>,
     /// The SHA-256 of the image the recovery is made on, in lowercase hex:
     /// a recovery partition's own, or the vendor boot image's where the
     /// recovery lives there.
@@ -693,13 +695,17 @@ impl DeviceConfig {
         }
         check_given("[[owners]]", &cfg.owners)?;
         if let Some(stock) = &cfg.stock {
-            let name = stock.package.rsplit('/').next().unwrap_or_default();
-            ensure!(
-                stock.package.starts_with("https://") && name.ends_with(".zip") && name.contains(&stock.version) && !stock.version.is_empty(),
-                "[stock] package: {} is not an HTTPS address of the full package of {}",
-                stock.package,
-                stock.version
-            );
+            ensure!(!stock.version.is_empty(), "[stock] version is empty");
+            match (&stock.package, &stock.image) {
+                (Some(package), None) => {
+                    let name = package.rsplit('/').next().unwrap_or_default();
+                    ensure!(package.starts_with("https://") && name.ends_with(".zip") && name.contains(&stock.version),
+                        "[stock] package: {package} is not an HTTPS address of the full package of {}", stock.version);
+                }
+                (None, Some(image)) => ensure!(image.starts_with("https://") && image.rsplit('/').next().is_some_and(|name| name.ends_with(".img")),
+                    "[stock] image: {image} is not an HTTPS image address"),
+                _ => anyhow::bail!("[stock] requires exactly one of package or image"),
+            }
             ensure!(
                 stock.recovery.len() == 64 && stock.recovery.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
                 "[stock] recovery: {} is not a SHA-256 in lowercase hex",
@@ -967,7 +973,8 @@ mod tests {
         ] {
             let stock = DeviceConfig::parse(text).unwrap().stock.expect("a stock build to build on");
             assert_eq!(stock.version, version);
-            assert!(stock.package.ends_with(".zip") && stock.package.contains(&format!("/{version}/")), "{}", stock.package);
+            let package = stock.package.unwrap();
+            assert!(package.ends_with(".zip") && package.contains(&format!("/{version}/")), "{package}");
         }
     }
 
@@ -983,6 +990,14 @@ mod tests {
         let other = ok.replace("version = \"OS1.0.1.0", "version = \"OS1.0.2.0");
         assert!(DeviceConfig::parse(&format!("{other}recovery = \"{hash}\"\n")).is_err(), "the package of another build");
         assert_eq!(DeviceConfig::parse("[device]\ncodename = \"x\"\n").unwrap().stock, None);
+    }
+
+    #[test]
+    fn standalone_image_requires_https_and_excludes_package() {
+        let base = "[device]\ncodename = \"x\"\n[stock]\nversion = \"build\"\nimage = \"https://example.org/vendor_boot.img\"\nrecovery = \"faa425b10231a0cfe2d74ff34f344f032ee2d891ea5e9420bf4e67cd86d622a7\"\n";
+        assert!(DeviceConfig::parse(base).is_ok());
+        assert!(DeviceConfig::parse(&base.replace("https://", "http://")).is_err());
+        assert!(DeviceConfig::parse(&format!("{base}package = \"https://example.org/build.zip\"\n")).is_err());
     }
 
     #[test]

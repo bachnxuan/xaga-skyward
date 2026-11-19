@@ -42,6 +42,12 @@ impl Kept {
             Slot::A => (a, image_a),
             Slot::B => (b, image_b),
         };
+        let image = if held.skyward && partition == "vendor_boot" {
+            let vendor = skyward_bootimg::VendorBootImage::parse(&image).context("read current vendor boot")?;
+            vendor.recovery()?.context("current vendor boot has no recovery fragment")?.to_vec()
+        } else {
+            image
+        };
         Ok(held.skyward.then(|| Kept {
             dir: dir.to_path_buf(),
             partition: partition.to_string(),
@@ -55,14 +61,30 @@ impl Kept {
     /// the partitions hold once the install is done; `next` is the slot
     /// that starts next.
     pub fn wanted(&self, next: Slot) -> Result<Vec<Slot>> {
-        let (a, _) = read(&image::device(&self.dir, &self.partition, Slot::A))?;
-        let (b, _) = read(&image::device(&self.dir, &self.partition, Slot::B))?;
-        Ok(restore(self.before, [a, b], self.own, next))
+        let (a, image_a) = read(&image::device(&self.dir, &self.partition, Slot::A))?;
+        let (b, image_b) = read(&image::device(&self.dir, &self.partition, Slot::B))?;
+        let mut slots = restore(self.before, [a, b], self.own, next);
+        if self.partition == "vendor_boot" {
+            let (held, bytes) = match next {
+                Slot::A => (a, image_a),
+                Slot::B => (b, image_b),
+            };
+            if held.skyward {
+                let vendor = skyward_bootimg::VendorBootImage::parse(&bytes)?;
+                if vendor.recovery()? == Some(self.image.as_slice()) {
+                    slots.retain(|&slot| slot != next);
+                }
+            }
+        }
+        Ok(slots)
     }
 
     /// Write this recovery into the recovery partitions of `slots` and read
     /// each back; `progress` hears the bytes so far, of all.
     pub fn write(&self, slots: &[Slot], progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
+        if self.partition == "vendor_boot" {
+            return crate::upgrade::write_vendor_boot(&self.dir, &self.image, slots, progress);
+        }
         let devices: Vec<PathBuf> = slots.iter().map(|&slot| image::device(&self.dir, &self.partition, slot)).collect();
         image::flash(&mut Cursor::new(&self.image), self.image.len() as u64, &devices, progress)
     }
