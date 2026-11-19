@@ -2588,9 +2588,11 @@ name = "skyward-pack"
 version = "0.3.6"
 dependencies = [
  "anyhow",
+ "cc",
  "clap",
  "hex",
  "libc",
+ "pkg-config",
  "rust-fs-core",
  "rust-fs-erofs",
  "serde_json",

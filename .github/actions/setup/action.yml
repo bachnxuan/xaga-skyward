@@ -7,6 +7,15 @@ description: >-
 runs:
   using: composite
   steps:
+    - name: Build the host policy library
+      shell: bash
+      run: |
+        git clone --depth 1 --branch 3.11 https://github.com/SELinuxProject/selinux.git "$RUNNER_TEMP/selinux"
+
+        make -C "$RUNNER_TEMP/selinux/libsepol/include" PREFIX="$RUNNER_TEMP/libsepol" install
+        make -C "$RUNNER_TEMP/selinux/libsepol/src" -j2 \
+          PREFIX="$RUNNER_TEMP/libsepol" DISABLE_SHARED=y DISABLE_CIL=y install
+        echo "PKG_CONFIG_PATH=$RUNNER_TEMP/libsepol/lib/pkgconfig" >> "$GITHUB_ENV"
     - name: Install the toolchain rust-toolchain.toml names
       shell: bash
       run: rustup toolchain install

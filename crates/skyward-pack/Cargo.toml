@@ -9,6 +9,10 @@ publish = false
 name = "skyward-pack"
 path = "src/main.rs"
 
+[build-dependencies]
+cc = "1.8.0"
+pkg-config = "0.3.34"
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { version = "4.5.51", features = ["derive"] }
